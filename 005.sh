@@ -47,6 +47,10 @@
 #        را assert می‌کرد که ذاتاً فازمحور است و با تحویل فاز ۵ قطعاً می‌شکست؛ همان
 #        دو خط با جایگزین معنایی BR-004 («هیچ ریزفاکتوری برای پروندهٔ در انتظار
 #        تأمین وجود ندارد») پچ لنگرشده، idempotent و با پشتیبان می‌شوند.
+#   [C4] اصلاح اشتباه فاز ۳ [FIX-P3-2]: itr_border هنوز از `_sql_constraints` استفاده
+#        می‌کرد که Odoo 19 آن را نادیده می‌گیرد (هشدار «no longer supported» در لاگ)؛
+#        یعنی یکتایی کد مرز در دیتابیس هرگز ساخته نشده بود. با _inherit و
+#        models.Constraint (قرارداد ADR-022) بدون بازنویسی فایل فاز ۳ اصلاح شد.
 #   [C4] اصلاح اشتباه فاز ۳ [FIX-P3-1]: مقدار 'iranian' به سرویس Guarded داده می‌شد
 #        ولی سرویس فقط 'ir' را ایرانی می‌شناخت ⇒ سنجهٔ کد ملی/پلاک ایرانی دور زده
 #        می‌شد. اصلاح با _inherit روی itr.validation.service (نرمال‌سازی نام مستعار)
@@ -498,6 +502,37 @@ class ItrValidationServiceExt(models.AbstractModel):
         return super().check_plate(
             value, plate_type=self.normalize_origin(plate_type),
             res_model=res_model, res_id=res_id)
+PYEOF
+
+# ------------------------------------------- models/itr_border_constraint.py --
+write_utf8 "${CORE_DIR}/models/itr_border_constraint.py" <<'PYEOF'
+# -*- coding: utf-8 -*-
+"""[FIX-P3-2] Real database uniqueness of the customs border code (DM-101/DM-120).
+
+Phase 3 declared the rule with the legacy `_sql_constraints` attribute, which
+Odoo 19 no longer supports: the server only logs
+
+    Model attribute '_sql_constraints' is no longer supported,
+    please define models.Constraint on the model
+
+and the UNIQUE constraint was therefore NEVER created in PostgreSQL - a silent
+false green (the rule existed in the source, not in the database).
+
+It is repaired here by inheritance with models.Constraint (the contract locked
+in ADR-022), so no phase-3 file is rewritten (concern C2). If a legacy database
+already contains duplicated border codes, PostgreSQL refuses the constraint and
+Odoo logs a schema WARNING instead of creating it - the upgrade never breaks.
+"""
+from odoo import models
+
+
+class ItrBorder(models.Model):
+    _inherit = "itr.border"
+
+    _code_uniq = models.Constraint(
+        "unique(code)",
+        "Customs Border code must be unique!",
+    )
 PYEOF
 
 # ------------------------------------------------ models/itr_sales_slip.py --
@@ -2392,6 +2427,7 @@ for imp in (
     "from . import itr_cartable_mixin",
     "from . import itr_work_assignment_log",
     "from . import itr_validation_service_ext",
+    "from . import itr_border_constraint",
     "from . import itr_sales_slip",
     "from . import itr_trade_case_phase5",
 ):
@@ -3085,6 +3121,10 @@ unique(sales_slip_id, dispatch_no) با models.Constraint (ADR-022) + قفل س�
   قاعدهٔ «بدون بازنویسی» — پشتیبان در docs/phase5-backup/).
 [FIX-P4-2] ردیف کالا پس از ورود به تأییدات در سرور قفل می‌شود (FIN-014) و
   reserved/effective فقط با context موتور تناژ نوشته می‌شوند.
+[FIX-P3-2] itr_border فاز ۳ قانون یکتایی کد مرز را با `_sql_constraints` تعریف کرده
+  بود؛ Odoo 19 این ویژگی را پشتیبانی نمی‌کند و فقط هشدار می‌دهد، پس هیچ UNIQUE
+  واقعی در PostgreSQL ساخته نشده بود (سبزِ دروغین در سطح اسکیما). با _inherit و
+  models.Constraint (ADR-022) اصلاح شد؛ فایل فاز ۳ بازنویسی نشد.
 MDEOF
 log "ADR-023..027 به ARCHITECTURE_DECISIONS.md افزوده شد"
 else
@@ -3214,7 +3254,7 @@ write_utf8 "${DOC_DIR}/PHASE5-DELIVERY.md" <<MDEOF
 | 5.9 | اکشن «تحویل به واحد حمل» + رویداد slip.issued_to_transport + transport.case_created | NOT-001 |
 | C1 | itr.cartable.mixin (قرارداد فاز ۴) + itr.work.assignment.log؛ حمل روی میز سرپرست حمل (کم‌بارترین) | UX-011، G15، ADR-025 |
 | C2 | fingerprint ۲۲ قرارداد + پچ افزایشی + پشتیبان + بازاجرای تست‌های فاز ۳/۴ | پیوست ج، ADR-021 |
-| C4 | FIX-P3-1 (نام مستعار ایرانی در Guarded)، FIX-P4-1 (تست فازمحور BR-004)، FIX-P4-2 (قفل سرور ردیف کالا) | ADR-027 |
+| C4 | FIX-P3-1 (نام مستعار ایرانی در Guarded)، FIX-P3-2 (UNIQUE واقعی کد مرز به‌جای _sql_constraints)، FIX-P4-1 (تست فازمحور BR-004)، FIX-P4-2 (قفل سرور ردیف کالا) | ADR-027 |
 
 ## ۲) Scope خارج از فاز (عمداً انجام نشد)
 تب‌های عملیاتی حمل، بارنامه/باسکول/بیجک/ترخیص/POD، هزینهٔ داینامیک، چرخهٔ پرداخت،
@@ -3224,7 +3264,8 @@ write_utf8 "${DOC_DIR}/PHASE5-DELIVERY.md" <<MDEOF
 ## ۳) فایل‌های ایجادشده (جدید) و پچ‌شده (افزایشی)
 \`\`\`
 [NEW] itr_core/models/{itr_cartable_mixin.py, itr_work_assignment_log.py,
-                      itr_validation_service_ext.py, itr_sales_slip.py, itr_trade_case_phase5.py}
+                      itr_validation_service_ext.py, itr_border_constraint.py,
+                      itr_sales_slip.py, itr_trade_case_phase5.py}
 [NEW] itr_core/security/itr_core_phase5_rules.xml
 [NEW] itr_core/data/{itr_sales_slip_data.xml, itr_core_phase5_notify_events.xml}
 [NEW] itr_core/views/{itr_sales_slip_views.xml, itr_work_assignment_views.xml, itr_core_phase5_menus.xml}
@@ -3282,7 +3323,7 @@ cat <<FINAL
  حمل           : ایجاد خودکار idempotent (5.5) | snapshot BR-052 | شمارهٔ فاکتور از ریزفاکتور خودش (5.7)
  رابطه         : Trade Case (1) ──< Sales Slip (1..N) ──< Transport Case (1..N)
  کارتابل       : itr.cartable.mixin (قرارداد فاز ۴) — حمل روی میز سرپرست حمل
- اصلاح‌ها      : FIX-P3-1 / FIX-P4-1 / FIX-P4-2 (ADR-027)
+ اصلاح‌ها      : FIX-P3-1 / FIX-P3-2 / FIX-P4-1 / FIX-P4-2 (ADR-027)
  verify        : ${OPS_DIR}/verify/verify_phase5.py
  گزارش تحویل   : ${DOC_DIR}/PHASE5-DELIVERY.md
  Git           : HEAD=${GIT_HEAD}  tag=phase-5

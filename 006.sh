@@ -12,8 +12,16 @@
 #       G04/G05/G06/G07/G08/G09/G14/G15، DM-105..108، X08/X10/X11/X12/X15/X17
 # سبک اجرا: کاملاً هم‌خانوادهٔ 00.sh … 005.sh همین مخزن.
 # اصلاحیهٔ این نسخه (حداقلی، بدون دورزدن هیچ Gate/verify):
-#   [FIX-P6-1] تبدیل UniqueViolation ایندکس بارنامه به ValidationError (OPS-021)
+#   [FIX-P6-1] کشف بارنامهٔ تکراری *پیش از* flush و تبدیل آن به ValidationError فارسی
+#              (OPS-021). ریشهٔ قرمزی G6-09/G6-10: Cursor.savepoint() پیش‌فرض
+#              flush=True دارد، پس UniqueViolation *بیرون* از savepoint رخ می‌داد،
+#              تراکنش abort می‌شد و کوئری بعدی InFailedSqlTransaction می‌داد.
 #   [FIX-P6-2] ردیف معکوس با state=reversed تا موتور مالی واحد پس از ابطال صفر گزارش کند (FIN-031)
+#   [FIX-P6-4] تست ۲۴ فاز ۶: assertRaises((AccessError, UserError)) در Odoo 19
+#              TypeError می‌دهد (issubclass() arg 1 must be a class)؛ همان اصطلاح
+#              اثبات‌شدهٔ فاز ۵ (try/except + self.fail) جایگزین شد.
+#   [FIX-P6-5] verify فاز ۶: هر تست منفی داخل env.cr.savepoint() اجرا می‌شود (همان
+#              الگوی verify فاز ۵) تا شکست یک probe، سنجه‌های بعدی را آلوده نکند.
 #   + گزارش Traceback کامل تست‌های ناموفق در خروجی Gate (فقط شفافیت، نه تغییر منطق)
 #
 # پوشش کامل چک‌لیست فاز ۶ (روی اسکلت فاز ۵ — فقط با _inherit و فایل‌های جدید):
@@ -1073,8 +1081,6 @@ station queue. Only the four allowed locks exist (SRS 7-4):
   L3 close needs the 10-item checklist    (action_close)
   L4 settled needs two independent flags  (action_settle)
 """
-import psycopg2
-
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
 
@@ -1359,33 +1365,66 @@ class ItrTransportCase(models.Model):
                 "(company_id, COALESCE(waybill_issuer, ''), waybill_number) "
                 "WHERE waybill_number IS NOT NULL AND state != 'cancelled'" % self._table)
 
+    def _waybill_duplicate_name(self, company_id, issuer, number, exclude_id=0):
+        """[FIX-P6-1] Pre-flush lookup of a duplicate waybill (OPS-021).
+
+        The REAL partial unique index stays the source of truth (proved by
+        G6-08 from pg_indexes), but the duplicate is detected BEFORE the ORM
+        flushes the row, so the user always gets the Persian ValidationError
+        instead of a raw psycopg2.UniqueViolation that aborts the whole
+        transaction. That abort was the root cause of the red G6-09/G6-10:
+        Cursor.savepoint() flushes BEFORE it opens the savepoint, so the
+        violation happened outside of it and the next query of the same
+        transaction raised InFailedSqlTransaction (test_20 ERROR and the
+        verify_phase6 crash right after V6-01).
+        """
+        if not number:
+            return False
+        self.env.cr.execute(
+            'SELECT name FROM "%s" ' % self._table
+            + "WHERE id != %s AND company_id = %s "
+              "AND COALESCE(waybill_issuer, '') = %s AND waybill_number = %s "
+              "AND state != 'cancelled' LIMIT 1",
+            (exclude_id or 0, company_id, (issuer or "").strip(), number))
+        row = self.env.cr.fetchone()
+        return row[0] if row else False
+
+    def _raise_waybill_duplicate(self, number, issuer, other_name):
+        """One single message (one msgid -> one Persian translation, OPS-021)."""
+        raise ValidationError(
+            _("Waybill %(w)s of issuer '%(i)s' already exists on loading %(n)s (OPS-021). "
+              "Open that loading to see its history.", w=number,
+              i=issuer or "-", n=other_name))
+
+    def _check_waybill_duplicate_vals(self, vals):
+        """[FIX-P6-1] OPS-021 guard executed BEFORE super().write() flushes."""
+        seen = {}
+        for record in self:
+            number = (vals.get("waybill_number", record.waybill_number) or "").strip()
+            if not number or vals.get("state", record.state) == "cancelled":
+                continue
+            issuer = (vals.get("waybill_issuer", record.waybill_issuer) or "").strip()
+            company_id = vals.get("company_id") or record.company_id.id
+            key = (company_id, issuer, number)
+            if key in seen:
+                record._raise_waybill_duplicate(number, issuer, seen[key])
+            seen[key] = record.name
+            other = record._waybill_duplicate_name(company_id, issuer, number, record.id)
+            if other:
+                record._raise_waybill_duplicate(number, issuer, other)
+        return True
+
     @api.constrains("waybill_number", "waybill_issuer", "company_id", "state")
     def _check_waybill_unique(self):
-        # [FIX-P6-1] Flush the pending values INSIDE a savepoint first, so the REAL
-        # unique index (OPS-021) always answers as a ValidationError - never as a raw
-        # psycopg2.UniqueViolation that aborts the whole transaction (root cause of
-        # the red G6-09/G6-10: test_20 ERROR and the verify_phase6 crash after V6-01).
+        """Backstop of the real unique index for every path (create included)."""
         for record in self:
             if not record.waybill_number or record.state == "cancelled":
                 continue
-            duplicate_hint = False
-            try:
-                with self.env.cr.savepoint():
-                    record.flush_model(["company_id", "waybill_issuer", "waybill_number", "state"])
-            except psycopg2.IntegrityError:
-                duplicate_hint = True
-            self.env.cr.execute(
-                'SELECT name FROM "%s" ' % self._table
-                + "WHERE id != %s AND company_id = %s "
-                  "AND COALESCE(waybill_issuer, '') = %s AND waybill_number = %s "
-                  "AND state != 'cancelled' LIMIT 1",
-                (record.id or 0, record.company_id.id, record.waybill_issuer or "", record.waybill_number))
-            row = self.env.cr.fetchone()
-            if row or duplicate_hint:
-                raise ValidationError(
-                    _("Waybill %(w)s of issuer '%(i)s' already exists on loading %(n)s (OPS-021). "
-                      "Open that loading to see its history.", w=record.waybill_number,
-                      i=record.waybill_issuer or "-", n=row[0] if row else "-"))
+            other = record._waybill_duplicate_name(
+                record.company_id.id, record.waybill_issuer, record.waybill_number, record.id)
+            if other:
+                record._raise_waybill_duplicate(
+                    record.waybill_number, record.waybill_issuer, other)
 
     @api.constrains("payee_sheba")
     def _check_payee_sheba(self):
@@ -1439,6 +1478,20 @@ class ItrTransportCase(models.Model):
                     _("Field '%(f)s' belongs to the '%(t)s' tab; your role may not edit it "
                       "(SRS 4-3 / G14 / OPS-003).", f=field_name, t=tab))
 
+    @api.model_create_multi
+    def create(self, vals_list):
+        """[FIX-P6-1] The same OPS-021 guard on the creation path."""
+        for vals in vals_list:
+            number = (vals.get("waybill_number") or "").strip()
+            if not number or vals.get("state") == "cancelled":
+                continue
+            other = self._waybill_duplicate_name(
+                vals.get("company_id") or self.env.company.id,
+                vals.get("waybill_issuer"), number)
+            if other:
+                self._raise_waybill_duplicate(number, vals.get("waybill_issuer"), other)
+        return super().create(vals_list)
+
     def write(self, vals):
         engine = self.env.context.get(TRANSPORT_ENGINE_CTX) or self.env.context.get("itr_cartable_engine")
         if not engine:
@@ -1451,6 +1504,9 @@ class ItrTransportCase(models.Model):
                 for record in self:
                     validate_upload(self.env, vals.get("delivery_receipt_name", record.delivery_receipt_name),
                                     vals["delivery_receipt"], _("Delivery receipt"))
+        # [FIX-P6-1] OPS-021 is checked BEFORE the flush, on every write path
+        if "waybill_number" in vals or "waybill_issuer" in vals:
+            self._check_waybill_duplicate_vals(vals)
         result = super().write(vals)
         if not engine:
             self._after_write_hooks(vals)
@@ -2972,13 +3028,25 @@ class TestItrTransportOpsPhase6(ItrTransportCase):
             tc.sudo().write({"finance_approved": True})
         adv = self._cost(tc, "advance_freight", 1_000_000.0, self.delivery, payee="TEST driver")
         request = adv.with_user(self.delivery).action_request_payment()
-        with self.assertRaises((AccessError, UserError)):
+        # [FIX-P6-4] Odoo 19 assertRaises() does not accept a tuple of exception
+        # classes (TypeError: issubclass() arg 1 must be a class). Same idiom as
+        # the phase-5 tests: AccessError is the ACL refusal, UserError the guard.
+        try:
             request.with_user(self.delivery).action_execute()
-        with self.assertRaises((AccessError, UserError)):
+            self.fail("a transport user must not execute a payment (L2 / FIN-029)")
+        except (AccessError, UserError):
+            pass
+        try:
             adv.with_user(self.delivery).write({"payment_status": "paid"})
-        with self.assertRaises((AccessError, UserError)):
+            self.fail("a transport user must not mark his own cost line as paid (FIN-029)")
+        except (AccessError, UserError):
+            pass
+        try:
             self.env["itr.payment.execution"].with_user(self.delivery).create({
                 "payment_request_id": request.id, "amount": 1.0, "currency_id": self.env.company.currency_id.id})
+            self.fail("a transport user must not create a payment execution (key B / L2)")
+        except (AccessError, UserError):
+            pass
 
     def test_25_weights_and_bijak_guards(self):
         case, slip, tc = self._authorized()
@@ -3497,7 +3565,8 @@ try:
     case2, slip2, tc2 = loading()
     dup = False
     try:
-        waybill(tc2, "V6-WB-1")
+        with env.cr.savepoint():          # [FIX-P6-5] same pattern as verify_phase5
+            waybill(tc2, "V6-WB-1")
     except ValidationError:
         dup = True
     env.cr.execute("SELECT count(*) FROM pg_indexes WHERE indexname='itr_transport_case_waybill_uniq'")
@@ -3508,7 +3577,8 @@ try:
     to_payment(tc2, "V6-WB-2")
     bad_weight = False
     try:
-        tc2.with_user(docs).write({"gross_weight": 10.0, "tare_weight": 20.0})
+        with env.cr.savepoint():          # [FIX-P6-5]
+            tc2.with_user(docs).write({"gross_weight": 10.0, "tare_weight": 20.0})
     except ValidationError:
         bad_weight = True
     case3, slip3, tc3 = loading()
@@ -3520,7 +3590,8 @@ try:
     tc3.with_user(customs).action_confirm_weighbridge()
     no_files = False
     try:
-        tc3.with_user(customs).action_confirm_bijak()
+        with env.cr.savepoint():          # [FIX-P6-5]
+            tc3.with_user(customs).action_confirm_bijak()
     except UserError:
         no_files = True
     chk("V6-03", "وزن پر<خالی رد شد؛ بیجک لازم بدون فایل مسدود شد (6.5/6.6)", bad_weight and no_files
@@ -3536,7 +3607,8 @@ try:
     fin_line = cost(tc2, "final_freight", 30_000_000.0, delivery, "TEST driver")
     locked = False
     try:
-        fin_line.with_user(delivery).action_request_payment()
+        with env.cr.savepoint():          # [FIX-P6-5]
+            fin_line.with_user(delivery).action_request_payment()
     except UserError:
         locked = True
     tc2.with_user(delivery).write({"delivery_receipt": PDF, "delivery_receipt_name": "pod.pdf"})
@@ -3552,7 +3624,8 @@ try:
     d1.with_user(delivery).action_request_payment()
     key_a = False
     try:
-        d2.with_user(delivery).action_request_payment()
+        with env.cr.savepoint():          # [FIX-P6-5]
+            d2.with_user(delivery).action_request_payment()
     except ValidationError:
         key_a = True
     env.cr.execute("SELECT count(*) FROM pg_indexes WHERE indexname='itr_payment_request_key_a_uniq'")
@@ -3566,12 +3639,14 @@ try:
     execution = request.with_user(fin_sup).action_execute()
     double = False
     try:
-        request.with_user(fin_sup).action_execute()
+        with env.cr.savepoint():          # [FIX-P6-5]
+            request.with_user(fin_sup).action_execute()
     except UserError:
         double = True
     no_delete = False
     try:
-        execution.with_user(fin_sup).unlink()
+        with env.cr.savepoint():          # [FIX-P6-5]
+            execution.with_user(fin_sup).unlink()
     except UserError:
         no_delete = True
     reversal = execution.with_user(fin_sup).action_reverse(reason="TEST v6 reversal")
@@ -3583,7 +3658,8 @@ try:
     tc2.with_user(fin_sup).write({"finance_settled": True, "chk_purchase": True, "chk_sales": True, "finance_approved": True})
     nine = False
     try:
-        tc2.with_user(fin_sup).action_close()   # d1 requested again after reversal -> chk_payments False
+        with env.cr.savepoint():          # [FIX-P6-5]
+            tc2.with_user(fin_sup).action_close()   # d1 requested again after reversal -> chk_payments False
     except UserError:
         nine = True
     request.with_user(fin_sup).action_execute()
@@ -3596,15 +3672,18 @@ try:
     # V6-08 finance flags / execution by transport user
     f1 = f2 = f3 = False
     try:
-        tc3.with_user(docs).write({"finance_approved": True})
+        with env.cr.savepoint():          # [FIX-P6-5]
+            tc3.with_user(docs).write({"finance_approved": True})
     except UserError:
         f1 = True
     try:
-        tc3.sudo().write({"finance_approved": True})
+        with env.cr.savepoint():          # [FIX-P6-5]
+            tc3.sudo().write({"finance_approved": True})
     except UserError:
         f2 = True
     try:
-        env["itr.payment.execution"].with_user(delivery).create({"payment_request_id": request.id, "amount": 1.0, "currency_id": env.company.currency_id.id})
+        with env.cr.savepoint():          # [FIX-P6-5]
+            env["itr.payment.execution"].with_user(delivery).create({"payment_request_id": request.id, "amount": 1.0, "currency_id": env.company.currency_id.id})
     except (AccessError, UserError):
         f3 = True
     chk("V6-08", "کارشناس حمل نمی‌تواند finance_approved/پرداخت‌شده را بزند (L2/FIN-029)", f1 and f2 and f3)
@@ -3634,7 +3713,8 @@ try:
     # V6-11 reopen BR-123
     r_ok = r_bad = False
     try:
-        tc2.with_user(fin_sup).action_reopen(reason="TEST")
+        with env.cr.savepoint():          # [FIX-P6-5]
+            tc2.with_user(fin_sup).action_reopen(reason="TEST")
     except UserError:
         r_bad = True
     tc2.with_user(fin_mgr).action_reopen(reason="TEST v6 reopen")
@@ -4152,6 +4232,7 @@ write_utf8 "${DOC_DIR}/PHASE6-DELIVERY.md" <<MDEOF
 | گپ | DM-108، DM-101 (۲ مرز)، OPS-025، BR-123، L4، OPEN-01/02 پارامتری، NOT-031 (۶ سیاست SLA) | ADR-032 |
 | C1 | سه مالک تب + مالک کلی + ارجاع تب با دلیل داخل تیم؛ درخواست پرداخت روی mixin | UX-011، G15، SEC-004 |
 | C2 | fingerprint ۲۶ قرارداد؛ فقط _inherit؛ پشتیبان پیش/پس + بازیابی؛ بازاجرای تست‌های ۳/۴/۵ | Q10، پیوست ج |
+| اصلاح | FIX-P6-1 (کشف بارنامهٔ تکراری پیش از flush)، FIX-P6-2 (ردیف معکوس)، FIX-P6-4 (assertRaises بدون tuple)، FIX-P6-5 (savepoint در verify) | OPS-021، FIN-031، Q04، Q15 |
 
 ## ۲) Scope خارج از فاز (عمداً انجام نشد)
 ماتریس نهایی Record Rule «خودم/تیم/همه» و SoD کامل (فاز ۷)، کارتابل ده‌بخشی/Home/
