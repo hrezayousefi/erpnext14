@@ -11,6 +11,10 @@
 #       بخش ۹-۳ (چرخهٔ سه‌مرحله‌ای، FIN-021..031)، بخش ۱۰ (چک‌لیست ۱۰موردی، BR-101..123)،
 #       G04/G05/G06/G07/G08/G09/G14/G15، DM-105..108، X08/X10/X11/X12/X15/X17
 # سبک اجرا: کاملاً هم‌خانوادهٔ 00.sh … 005.sh همین مخزن.
+# اصلاحیهٔ این نسخه (حداقلی، بدون دورزدن هیچ Gate/verify):
+#   [FIX-P6-1] تبدیل UniqueViolation ایندکس بارنامه به ValidationError (OPS-021)
+#   [FIX-P6-2] ردیف معکوس با state=reversed تا موتور مالی واحد پس از ابطال صفر گزارش کند (FIN-031)
+#   + گزارش Traceback کامل تست‌های ناموفق در خروجی Gate (فقط شفافیت، نه تغییر منطق)
 #
 # پوشش کامل چک‌لیست فاز ۶ (روی اسکلت فاز ۵ — فقط با _inherit و فایل‌های جدید):
 #   6.1  itr.transport.case با رابطهٔ N:1 غیر یکتا (فاز ۵) — اثبات دوباره در pg_indexes
@@ -945,6 +949,10 @@ class ItrPaymentExecution(models.Model):
                 "exchange_rate": execution.exchange_rate,
                 "base_amount": -execution.base_amount,
                 "is_reversal": True,
+                # [FIX-P6-2] FIN-031: the reversed pair leaves the settled ledger
+                # TOGETHER, so the single money engine (state == "done") reports 0
+                # after a reversal instead of a negative double-count (test_26 FAIL).
+                "state": "reversed",
                 "reversed_execution_id": execution.id,
                 "reversal_reason": reason,
                 "bank_reference": execution.bank_reference,
@@ -1065,6 +1073,8 @@ station queue. Only the four allowed locks exist (SRS 7-4):
   L3 close needs the 10-item checklist    (action_close)
   L4 settled needs two independent flags  (action_settle)
 """
+import psycopg2
+
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
 
@@ -1351,20 +1361,31 @@ class ItrTransportCase(models.Model):
 
     @api.constrains("waybill_number", "waybill_issuer", "company_id", "state")
     def _check_waybill_unique(self):
+        # [FIX-P6-1] Flush the pending values INSIDE a savepoint first, so the REAL
+        # unique index (OPS-021) always answers as a ValidationError - never as a raw
+        # psycopg2.UniqueViolation that aborts the whole transaction (root cause of
+        # the red G6-09/G6-10: test_20 ERROR and the verify_phase6 crash after V6-01).
         for record in self:
             if not record.waybill_number or record.state == "cancelled":
                 continue
-            duplicate = self.search([
-                ("id", "!=", record.id), ("company_id", "=", record.company_id.id),
-                ("waybill_number", "=", record.waybill_number),
-                ("waybill_issuer", "=", record.waybill_issuer or False),
-                ("state", "!=", "cancelled"),
-            ], limit=1)
-            if duplicate:
+            duplicate_hint = False
+            try:
+                with self.env.cr.savepoint():
+                    record.flush_model(["company_id", "waybill_issuer", "waybill_number", "state"])
+            except psycopg2.IntegrityError:
+                duplicate_hint = True
+            self.env.cr.execute(
+                'SELECT name FROM "%s" ' % self._table
+                + "WHERE id != %s AND company_id = %s "
+                  "AND COALESCE(waybill_issuer, '') = %s AND waybill_number = %s "
+                  "AND state != 'cancelled' LIMIT 1",
+                (record.id or 0, record.company_id.id, record.waybill_issuer or "", record.waybill_number))
+            row = self.env.cr.fetchone()
+            if row or duplicate_hint:
                 raise ValidationError(
                     _("Waybill %(w)s of issuer '%(i)s' already exists on loading %(n)s (OPS-021). "
                       "Open that loading to see its history.", w=record.waybill_number,
-                      i=record.waybill_issuer or "-", n=duplicate.name))
+                      i=record.waybill_issuer or "-", n=row[0] if row else "-"))
 
     @api.constrains("payee_sheba")
     def _check_payee_sheba(self):
@@ -2894,6 +2915,7 @@ class TestItrTransportOpsPhase6(ItrTransportCase):
         self.assertTrue(logs)
 
     # ============================================================ negative
+    @mute_logger("odoo.sql_db")
     def test_20_duplicate_waybill_refused(self):
         case, slip, tc1 = self._authorized(50.0)
         case2, slip2, tc2 = self._authorized(50.0)
@@ -3770,7 +3792,7 @@ else
     gate "G6-09" "تست‌های فاز ۶ (۳ مثبت + ۶ منفی + گاردها) سبز + فازهای ۳/۴/۵ دوباره سبز (C2)" "PASS" "${TEST_TOTAL} rc=0"
   else
     gate "G6-09" "تست‌های خودکار فاز ۶ + بازاجرای ۳/۴/۵ سبز هستند" "FAIL" "rc=${TEST_RC} fails=${TEST_FAILS} broken=${TEST_BROKEN} → ${TEST_LOG}"
-    grep -E '(FAIL|ERROR): Test[A-Za-z0-9_]+\.test_|At least one test failed|Traceback \(most recent' "${TEST_LOG}" | head -n 20 || true
+    grep -A 40 -E '(FAIL|ERROR): Test[A-Za-z0-9_]+\.test_' "${TEST_LOG}" | head -n 200 || true
   fi
 fi
 
@@ -3792,7 +3814,7 @@ else
     gate "G6-10" "verify مستقل فاز ۶ سبز است (V6-01..V6-12)" "PASS" "${VERIFY_LINE}"
   else
     gate "G6-10" "verify مستقل فاز ۶ سبز است (V6-01..V6-12)" "FAIL" "${VERIFY_LINE:-خروجی یافت نشد} (rc=${VERIFY_RC}) → ${VERIFY_LOG}"
-    tail -n 40 "${VERIFY_LOG}"
+    tail -n 120 "${VERIFY_LOG}"
   fi
 fi
 
