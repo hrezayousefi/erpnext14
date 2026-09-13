@@ -22,6 +22,15 @@
 #              اثبات‌شدهٔ فاز ۵ (try/except + self.fail) جایگزین شد.
 #   [FIX-P6-5] verify فاز ۶: هر تست منفی داخل env.cr.savepoint() اجرا می‌شود (همان
 #              الگوی verify فاز ۵) تا شکست یک probe، سنجه‌های بعدی را آلوده نکند.
+#   [FIX-P6-6] ‏★ ریشهٔ قرمزی G6-10 در اجرای قبلی: FIN-001 روی فیلد محاسبه‌شدهٔ
+#              other_cost (roll-up فقط‌خواندنی بند 6.11) اعمال می‌شد، اما هیچ
+#              مسیری شرح سربرگ را پر نمی‌کرد؛ بنابراین اولین flush پس از ثبت
+#              هر هزینهٔ دستهٔ other با ValidationError متوقف می‌شد (V6-05 و همهٔ
+#              سنجه‌های بعدی). طبق G06/۸-۲ شرح هزینه روی خودِ ردیف (Child)
+#              زندگی می‌کند؛ پس FIN-001 در نقطهٔ ورود داده (itr.cost.line) اجباری
+#              شد و گارد سربرگ به‌عنوان backstop باقی ماند (شرح سربرگ یا شرح
+#              همهٔ ردیف‌های other). هیچ verify دور زده نشد: تست خودکار test_30
+#              و سنجهٔ مستقل V6-13 (مثبت + منفی) افزوده شدند.
 #   + گزارش Traceback کامل تست‌های ناموفق در خروجی Gate (فقط شفافیت، نه تغییر منطق)
 #
 # پوشش کامل چک‌لیست فاز ۶ (روی اسکلت فاز ۵ — فقط با _inherit و فایل‌های جدید):
@@ -546,6 +555,23 @@ class ItrCostLine(models.Model):
         for line in self:
             if line.payee_sheba:
                 service.check_sheba(line.payee_sheba, res_model=self._name, res_id=line.id)
+
+    @api.constrains("description", "charge_type_id")
+    def _check_other_needs_description(self):
+        """FIN-001 at the POINT OF ENTRY (FIX-P6-6).
+
+        SRS 8-3 requires a description as soon as 'other costs' are greater
+        than zero. With the Master/Child pattern (G06) the header amount is a
+        read-only roll-up, so the only place where a human can explain the
+        money is the cost line itself: an 'other' line without a description
+        is refused here, which also keeps the header constraint satisfiable
+        (an unexplained roll-up used to raise on every later flush).
+        """
+        for line in self:
+            category = line.charge_type_id.category or line.category
+            if category == "other" and not (line.description or "").strip():
+                raise ValidationError(
+                    _("A cost line of category 'other' needs a description (FIN-001)."))
 
     @api.constrains("installment_no")
     def _check_installment(self):
@@ -1318,11 +1344,27 @@ class ItrTransportCase(models.Model):
             record.advance_paid_base = figures["advance_paid"]
             record.final_freight_due = figures["final_freight_due"]
 
-    @api.constrains("other_cost", "other_cost_description")
+    @api.constrains("other_cost", "other_cost_description", "cost_line_ids")
     def _check_other_cost_description(self):
+        """FIN-001 backstop of the read-only roll-up (FIX-P6-6).
+
+        The explanation of an 'other' cost may come from the header field OR
+        from the cost lines that produced the amount (G06: the header is only
+        a roll-up). Enforcing it on the computed field alone made the rule
+        unsatisfiable: the amount appears during the recompute of a flush, so
+        nobody could ever record the description in time and every following
+        write of the loading raised (root cause of the red G6-10).
+        """
         for record in self:
-            if record.other_cost > 0 and not (record.other_cost_description or "").strip():
-                raise ValidationError(_("A description is mandatory when 'other costs' are greater than zero (FIN-001)."))
+            if record.other_cost <= 0:
+                continue
+            if (record.other_cost_description or "").strip():
+                continue
+            lines = record.cost_line_ids.filtered(
+                lambda l: l.category == "other" and l.payment_status != "rejected")
+            if lines and all((l.description or "").strip() for l in lines):
+                continue
+            raise ValidationError(_("A description is mandatory when 'other costs' are greater than zero (FIN-001)."))
 
     @api.depends("cost_line_ids.amount", "cost_line_ids.currency_id", "cost_line_ids.payment_status",
                  "payment_execution_ids.amount", "payment_execution_ids.currency_id",
@@ -2868,10 +2910,12 @@ class TestItrTransportOpsPhase6(ItrTransportCase):
         self.assertEqual(tc.state, "waiting_payment")
         return tc
 
-    def _cost(self, tc, code, amount, user, payee="TEST payee", installment=1):
-        return self.env["itr.cost.line"].with_user(user).create({
-            "transport_case_id": tc.id, "charge_type_id": self.charge[code].id,
-            "amount": amount, "payee_name": payee, "installment_no": installment})
+    def _cost(self, tc, code, amount, user, payee="TEST payee", installment=1, description=None):
+        vals = {"transport_case_id": tc.id, "charge_type_id": self.charge[code].id,
+                "amount": amount, "payee_name": payee, "installment_no": installment}
+        if description:
+            vals["description"] = description       # FIN-001 (FIX-P6-6)
+        return self.env["itr.cost.line"].with_user(user).create(vals)
 
     def _pay(self, line, user_request, bank="TEST-REF"):
         request = line.with_user(user_request).action_request_payment()
@@ -3123,6 +3167,26 @@ class TestItrTransportOpsPhase6(ItrTransportCase):
             tc.with_user(self.delivery).write({"delivery_receipt": PDF, "delivery_receipt_name": "pod.exe"})
         admin = self.env.ref("base.user_admin")
         self.assertNotIn(admin, tc.docs_owner_id | tc.customs_owner_id | tc.delivery_owner_id | tc.current_owner_id)
+
+    def test_30_other_cost_needs_a_description_and_never_blocks_the_loading(self):
+        """[FIX-P6-6] FIN-001: negative (no description) + positive (described).
+
+        The positive half is the real regression guard: before the fix the
+        header roll-up constraint raised at the first flush after an 'other'
+        cost line, which blocked the payment request and every later write.
+        """
+        case, slip, tc = self._authorized()
+        self._waybill(tc, "TEST-WB-30")
+        with self.assertRaises(ValidationError):
+            self._cost(tc, "other_cost", 100_000.0, self.delivery, payee="TEST other")
+        line = self._cost(tc, "other_cost", 100_000.0, self.delivery, payee="TEST other",
+                          description="TEST parking fee at the border")
+        self.assertAlmostEqual(tc.other_cost, 100_000.0, places=0)
+        request = line.with_user(self.delivery).action_request_payment()
+        self.assertEqual(line.payment_status, "requested")
+        self.assertTrue(request.id)
+        self.assertFalse(tc.other_cost_description,
+                         "the header description stays optional when the lines explain themselves")
 PYEOF
 
 # =============================================================================
@@ -3427,6 +3491,27 @@ msgstr "اجرای پرداخت هرگز حذف نمی‌شود؛ به‌جای 
     changed.append("i18n/fa_IR.po + phase-6 block")
 write(path, text)
 
+path = os.path.join(mod_dir, "i18n", "fa_IR.po")
+text = read(path)
+MARK_FIX6 = "#### itr_transport phase-6 FIX-P6-6 translations ####"
+if MARK_FIX6 not in text:
+    text = text.rstrip("\n") + "\n\n" + MARK_FIX6 + """
+
+#. module: itr_transport
+#: code:addons/itr_transport/models/itr_cost_line.py:0
+#, python-format
+msgid "A cost line of category 'other' needs a description (FIN-001)."
+msgstr "ردیف هزینهٔ دستهٔ «سایر» باید شرح داشته باشد (FIN-001)."
+
+#. module: itr_transport
+#: code:addons/itr_transport/models/itr_transport_case_ops.py:0
+#, python-format
+msgid "A description is mandatory when 'other costs' are greater than zero (FIN-001)."
+msgstr "وقتی «سایر هزینه‌ها» بزرگ‌تر از صفر است، ثبت شرح اجباری است (FIN-001)."
+"""
+    changed.append("i18n/fa_IR.po + FIX-P6-6 block")
+write(path, text)
+
 print("PATCH_RESULT changed=%d" % len(changed))
 for item in changed:
     print(" - " + item)
@@ -3441,7 +3526,7 @@ step "5) verify مستقل فاز ۶ (ops/verify/verify_phase6.py) — کارب�
 # =============================================================================
 write_utf8 "${OPS_DIR}/verify/verify_phase6.py" <<'PYEOF'
 # -*- coding: utf-8 -*-
-"""Independent verify of Phase 6 (V6-01 .. V6-12) - odoo shell, real users,
+"""Independent verify of Phase 6 (V6-01 .. V6-13) - odoo shell, real users,
 rolled back at the end (ADR-005 / Q15 / G01)."""
 import base64
 import sys
@@ -3539,9 +3624,12 @@ try:
         tc.with_user(customs).write({"customs_broker_id": broker.id, "clearance_status": "cleared"})
         tc.with_user(customs).action_confirm_clearance()
 
-    def cost(tc, code, amount, user, payee, installment=1):
-        return env["itr.cost.line"].with_user(user).create({"transport_case_id": tc.id, "charge_type_id": charge[code].id,
-                                                           "amount": amount, "payee_name": payee, "installment_no": installment})
+    def cost(tc, code, amount, user, payee, installment=1, description=None):
+        vals = {"transport_case_id": tc.id, "charge_type_id": charge[code].id,
+                "amount": amount, "payee_name": payee, "installment_no": installment}
+        if description:
+            vals["description"] = description       # FIN-001 (FIX-P6-6)
+        return env["itr.cost.line"].with_user(user).create(vals)
 
     def pay(line, user):
         request = line.with_user(user).action_request_payment()
@@ -3619,8 +3707,10 @@ try:
         "settled=%s due=%s" % (tc2.total_settled, tc2.final_freight_due))
 
     # V6-05 key A duplicate
-    d1 = cost(tc2, "other_cost", 100_000.0, delivery, "TEST other")
-    d2 = cost(tc2, "other_cost", 100_000.0, delivery, "TEST other")
+    d1 = cost(tc2, "other_cost", 100_000.0, delivery, "TEST other",
+              description="TEST v6 other cost reason")      # FIN-001 (FIX-P6-6)
+    d2 = cost(tc2, "other_cost", 100_000.0, delivery, "TEST other",
+              description="TEST v6 other cost reason")
     d1.with_user(delivery).action_request_payment()
     key_a = False
     try:
@@ -3729,6 +3819,21 @@ try:
     chk("V6-12", "گپ‌های SRS پر شد: ۱۱ نوع سند (DM-108)، دو مرز غایب (DM-101)، ۶ سیاست SLA روی موتور فاز ۲ (NOT-031/G18)",
         doc_types >= 11 and borders == 2 and policies == 6 and watches > 0,
         "docs=%s borders=%s policies=%s watches=%s" % (doc_types, borders, policies, watches))
+
+    # V6-13 [FIX-P6-6] FIN-001 where the data is entered; the roll-up never blocks
+    fin001_refused = False
+    try:
+        with env.cr.savepoint():          # [FIX-P6-5]
+            cost(tc3, "other_cost", 50_000.0, delivery, "TEST other")
+    except ValidationError:
+        fin001_refused = True
+    described = cost(tc3, "other_cost", 50_000.0, delivery, "TEST other",
+                     description="TEST v6 border parking")
+    described.with_user(delivery).action_request_payment()
+    chk("V6-13", "هزینهٔ دستهٔ «سایر» بدون شرح رد شد؛ با شرح، roll-up سربرگ دیگر پرونده را قفل نمی‌کند (FIN-001/FIX-P6-6)",
+        fin001_refused and abs(tc3.other_cost - 50_000.0) < 1e-6
+        and described.payment_status == "requested",
+        "other_cost=%s status=%s" % (tc3.other_cost, described.payment_status))
 
 except Exception as error:  # noqa: BLE001
     traceback.print_exc()
@@ -3877,10 +3982,10 @@ else
 fi
 
 # =============================================================================
-step "9) verify مستقل V6-01..V6-12 (بدون sudo، rollback در پایان)"
+step "9) verify مستقل V6-01..V6-13 (بدون sudo، rollback در پایان)"
 # =============================================================================
 if [[ "${SKIP_VERIFY}" == "1" ]]; then
-  gate "G6-10" "verify مستقل فاز ۶ سبز است (V6-01..V6-12)" "FAIL" "SKIP_VERIFY=1 (طبق Q15 اجباری است)"
+  gate "G6-10" "verify مستقل فاز ۶ سبز است (V6-01..V6-13)" "FAIL" "SKIP_VERIFY=1 (طبق Q15 اجباری است)"
 else
   set +e
   python "${ODOO_DIR}/odoo-bin" shell -c "${CONF_FILE}" -d "${DB_NAME}" \
@@ -3891,9 +3996,9 @@ else
   VERIFY_LINE="$(grep -E '^ITR_VERIFY_RESULT:' "${VERIFY_LOG}" | tail -n1 || true)"
   echo "${VERIFY_LINE}"
   if echo "${VERIFY_LINE}" | grep -q 'ITR_VERIFY_RESULT: PASS'; then
-    gate "G6-10" "verify مستقل فاز ۶ سبز است (V6-01..V6-12)" "PASS" "${VERIFY_LINE}"
+    gate "G6-10" "verify مستقل فاز ۶ سبز است (V6-01..V6-13)" "PASS" "${VERIFY_LINE}"
   else
-    gate "G6-10" "verify مستقل فاز ۶ سبز است (V6-01..V6-12)" "FAIL" "${VERIFY_LINE:-خروجی یافت نشد} (rc=${VERIFY_RC}) → ${VERIFY_LOG}"
+    gate "G6-10" "verify مستقل فاز ۶ سبز است (V6-01..V6-13)" "FAIL" "${VERIFY_LINE:-خروجی یافت نشد} (rc=${VERIFY_RC}) → ${VERIFY_LOG}"
     tail -n 120 "${VERIFY_LOG}"
   fi
 fi
@@ -4232,7 +4337,7 @@ write_utf8 "${DOC_DIR}/PHASE6-DELIVERY.md" <<MDEOF
 | گپ | DM-108، DM-101 (۲ مرز)، OPS-025، BR-123، L4، OPEN-01/02 پارامتری، NOT-031 (۶ سیاست SLA) | ADR-032 |
 | C1 | سه مالک تب + مالک کلی + ارجاع تب با دلیل داخل تیم؛ درخواست پرداخت روی mixin | UX-011، G15، SEC-004 |
 | C2 | fingerprint ۲۶ قرارداد؛ فقط _inherit؛ پشتیبان پیش/پس + بازیابی؛ بازاجرای تست‌های ۳/۴/۵ | Q10، پیوست ج |
-| اصلاح | FIX-P6-1 (کشف بارنامهٔ تکراری پیش از flush)، FIX-P6-2 (ردیف معکوس)، FIX-P6-4 (assertRaises بدون tuple)، FIX-P6-5 (savepoint در verify) | OPS-021، FIN-031، Q04، Q15 |
+| اصلاح | FIX-P6-1 (کشف بارنامهٔ تکراری پیش از flush)، FIX-P6-2 (ردیف معکوس)، FIX-P6-4 (assertRaises بدون tuple)، FIX-P6-5 (savepoint در verify)، FIX-P6-6 (FIN-001 در نقطهٔ ورود داده به‌جای roll-up محاسبه‌شده + تست test_30 و سنجهٔ V6-13) | OPS-021، FIN-031، FIN-001، Q04، Q15 |
 
 ## ۲) Scope خارج از فاز (عمداً انجام نشد)
 ماتریس نهایی Record Rule «خودم/تیم/همه» و SoD کامل (فاز ۷)، کارتابل ده‌بخشی/Home/
