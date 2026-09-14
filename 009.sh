@@ -1069,7 +1069,7 @@ class ItrReportEngine(models.AbstractModel):
         reg = self._registry()
         dom = reg.operational_domain("itr.trade.case") + self._date_domain("create_date", options)
         cases = self.env["itr.trade.case"].search(dom, order="id asc")
-        dim = {"customer": "customer_id", "factory": "factory_id"}.get(options.get("group_by"))
+        dim = {"customer": "buyer_id", "factory": "factory_id"}.get(options.get("group_by"))
         columns = [
             _col("label", "تفکیک") if dim else _col("name", "پرونده"),
             _col("sales", "فروش (ریال)", "money_base"),
@@ -1477,7 +1477,7 @@ class ItrReportFinancial26(models.AbstractModel):
                 # sale side - filled ONLY for a sale logical row (REP-011)
                 "sales_date": jal.to_jalali_str(case.create_date) if is_sale else "",
                 "sales_inv": (case.proforma_sales_ref or case.name) if is_sale else "",
-                "customer": (case.customer_id.display_name or "") if is_sale else "",
+                "customer": (case.buyer_id.display_name or "") if is_sale else "",
                 "item_s": (item.name or "") if is_sale else "",
                 "plan_s": planned if is_sale else 0.0,
                 "amount_fx_s": ("%s %s" % (item.sale_amount or 0.0,
@@ -3341,7 +3341,7 @@ import sys
 COLS = [
     ("sales_date", "تاریخ فروش", "itr.trade.case.create_date", "trade_case_item", "date", 0),
     ("sales_inv", "ش.فاکتور فروش", "itr.trade.case.proforma_sales_ref", "trade_case_item", "text", 0),
-    ("customer", "مشتری", "itr.trade.case.customer_id", "trade_case_item", "text", 0),
+    ("customer", "مشتری", "itr.trade.case.buyer_id", "trade_case_item", "text", 0),
     ("item_s", "نوع کالا", "itr.trade.case.item.name", "trade_case_item", "text", 0),
     ("plan_s", "تناژ اصلی فروش", "metric:planned", "trade_case_item", "tonne", 0),
     ("amount_fx_s", "مبلغ ارزی", "itr.trade.case.item.sale_amount", "trade_case_item", "money_src", 0),
@@ -3503,7 +3503,7 @@ write_utf8 "${REP_DIR}/report/itr_report_prints.xml" <<'XMLEOF'
                     <t t-call="itr_reports.itr_print_kv"><t t-set="k">شمارهٔ پرونده</t><t t-set="v" t-value="itr_fa_num(o.name)"/></t>
                     <t t-call="itr_reports.itr_print_kv"><t t-set="k">الگوی معامله</t><t t-set="v" t-value="o.deal_pattern"/></t>
                     <t t-call="itr_reports.itr_print_kv"><t t-set="k">دستوردهنده</t><t t-set="v" t-value="o.requested_by.name"/></t>
-                    <t t-call="itr_reports.itr_print_kv"><t t-set="k">مشتری</t><t t-set="v" t-value="o.customer_id.display_name"/></t>
+                    <t t-call="itr_reports.itr_print_kv"><t t-set="k">مشتری</t><t t-set="v" t-value="o.buyer_id.display_name"/></t>
                     <t t-call="itr_reports.itr_print_kv"><t t-set="k">کارخانه</t><t t-set="v" t-value="o.factory_id.display_name"/></t>
                     <t t-call="itr_reports.itr_print_kv"><t t-set="k">مقصد</t><t t-set="v" t-value="o.destination"/></t>
                     <t t-call="itr_reports.itr_print_kv"><t t-set="k">تناژ قراردادی</t><t t-set="v" t-value="itr_fa_num(o.total_contract_tonnage)"/></t>
@@ -4265,7 +4265,7 @@ class TestReportsPhase9(TransactionCase):
             "requested_by": self.ceo.id if self.ceo else self.env.user.id,
             "deal_pattern": "buy_first",
             "factory_id": factory.id,
-            "customer_id": buyer.id,
+            "buyer_id": buyer.id,
             "destination": "TEST p9 destination",
             "item_ids": [(0, 0, {
                 "name": "TEST p9 mixed goods", "row_kind": "both",
@@ -4291,6 +4291,8 @@ class TestExcelPhase9(TransactionCase):
         super().setUpClass()
         cls.common = cls.env["itr.excel.common"]
         cls.imp = cls.env["itr.excel.import"]
+        cls.fin_user = cls.env["res.users"].search(
+            [("login", "=", "faezeh.heydari@irbco.local")], limit=1)
 
     # ------------------------------------------------------------- registry
     def test_10_five_templates_registered(self):
@@ -4368,11 +4370,12 @@ class TestExcelPhase9(TransactionCase):
             ["both", "TEST p9 row ok", 10, 100, "IRR", 120, "IRR", "PP-1", "PS-1"],
             ["both", "TEST p9 row bad", 0, 100, "IRR", 120, "IRR", "PP-2", "PS-2"],
         ])
-        result = self.imp.preview("proforma", "p9.xlsx", payload)
+        imp = self.imp.with_user(self.fin_user) if self.fin_user else self.imp
+        result = imp.preview("proforma", "p9.xlsx", payload)
         self.assertEqual(result["error"], 1)
         before = self.env["itr.trade.case.item"].search_count([])
         with self.assertRaises(UserError):
-            self.imp.commit(result["batch_id"], result["commit_token"], payload)
+            imp.commit(result["batch_id"], result["commit_token"], payload)
         self.assertEqual(self.env["itr.trade.case.item"].search_count([]), before)
 
     def test_95_sample_headers_exist(self):
@@ -4568,7 +4571,7 @@ try:
     buyer = Partner.create({"name": "TEST p9 buyer", "is_company": True})
     mixed = env["itr.trade.case"].with_user(fin_user).create({
         "requested_by": ceo.id, "deal_pattern": "buy_first",
-        "factory_id": factory.id, "customer_id": buyer.id,
+        "factory_id": factory.id, "buyer_id": buyer.id,
         "destination": "TEST p9 destination",
         "item_ids": [(0, 0, {"name": "TEST p9 mixed", "row_kind": "both",
                              "contract_tonnage": 40.0,
