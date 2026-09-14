@@ -822,7 +822,7 @@ Design rules honoured here:
            a payment is NEVER counted a second time as a cost (FIN-003).
   REP-006  every filter is applied server side and every read goes through the
            ORM with the CALLING user, so the phase 7 record rules apply.
-  REP-007  no raw SQL at all - not one env.cr.execute in this module.
+  REP-007  no raw SQL at all - ORM only, never a raw cursor execute in this module.
   G05      customs duty and clearance fee stay two independent columns.
   G07      the payment report reads ONLY itr.payment.execution.
   VAL-008  every sheba in every output uses the single masking helper.
@@ -4094,19 +4094,14 @@ write_utf8 "${REP_DIR}/views/itr_reports_menus.xml" <<'XMLEOF'
          the phase 8 workspaces are never disturbed (R1). -->
     <menuitem id="menu_itr_reports_root" name="گزارش‌ها و خروجی‌ها"
               parent="itr_core.menu_itr_core_root" sequence="11"
-              groups="itr_core.group_ceo,itr_core.group_financial_manager,
-                      itr_core.group_finance_supervisor,itr_core.group_finance_user,
-                      itr_core.group_transport_supervisor,itr_core.group_transport_docs,
-                      itr_core.group_customs_officer,itr_core.group_transport_delivery,
-                      itr_core.group_auditor"/>
+              groups="itr_core.group_ceo,itr_core.group_financial_manager,itr_core.group_finance_supervisor,itr_core.group_finance_user,itr_core.group_transport_supervisor,itr_core.group_transport_docs,itr_core.group_customs_officer,itr_core.group_transport_delivery,itr_core.group_auditor"/>
 
     <menuitem id="menu_itr_reports_center" name="مرکز گزارش‌ها (۱۵ گزارش)"
               parent="menu_itr_reports_root" action="action_itr_report_run" sequence="10"/>
 
     <menuitem id="menu_itr_reports_dictionary" name="فرهنگ دادهٔ گزارش‌ها (REP-001)"
               parent="menu_itr_reports_root" action="action_itr_report_column" sequence="80"
-              groups="itr_core.group_financial_manager,itr_core.group_auditor,
-                      itr_base.group_itr_settings_manager"/>
+              groups="itr_core.group_financial_manager,itr_core.group_auditor,itr_base.group_itr_settings_manager"/>
 
     <menuitem id="menu_itr_excel_root" name="اکسل" parent="menu_itr_reports_root" sequence="50"/>
     <menuitem id="menu_itr_excel_templates" name="قالب‌های کارفرما (رجیستری)"
@@ -4135,8 +4130,7 @@ write_utf8 "${REP_DIR}/views/itr_reports_workspace_menus.xml" <<'XMLEOF'
     <!-- فضای مالی و بازرگانی -->
     <menuitem id="menu_ws_fin_reports" name="گزارش‌ها و خروجی اکسل"
               parent="itr_core.menu_ws_finance" action="action_itr_report_run" sequence="90"
-              groups="itr_core.group_finance_supervisor,itr_core.group_finance_user,
-                      itr_core.group_financial_manager"/>
+              groups="itr_core.group_finance_supervisor,itr_core.group_finance_user,itr_core.group_financial_manager"/>
     <menuitem id="menu_ws_fin_excel" name="قالب‌های اکسل کارفرما"
               parent="itr_core.menu_ws_finance" action="action_itr_excel_template" sequence="95"
               groups="itr_core.group_finance_supervisor,itr_core.group_financial_manager"/>
